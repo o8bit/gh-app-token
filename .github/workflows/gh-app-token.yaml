@@ -3,13 +3,7 @@ name: gh-app-token
 on:
   push:
     branches: [main]
-    paths:
-      - 'gh-app-token/**'
-      - '.github/workflows/gh-app-token.yaml'
   pull_request:
-    paths:
-      - 'gh-app-token/**'
-      - '.github/workflows/gh-app-token.yaml'
   workflow_dispatch:
 
 jobs:
@@ -25,7 +19,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Build the image
-        run: docker build -t gh-app-token:ci gh-app-token/
+        run: docker build -t gh-app-token:ci .
 
       - name: Run the test suite inside the built image
         run: |
