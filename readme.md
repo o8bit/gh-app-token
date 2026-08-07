@@ -32,7 +32,7 @@ docker run --rm \
   -e GITHUB_APP_ID=123456 \
   -e GITHUB_APP_ORGS=YOUR_ORG \
   -e GITHUB_APP_TOKEN_DIR=/tokens \
-  ghcr.io/o8bit/gh-app-token:sha-ecbac13
+  ghcr.io/o8bit/gh-app-token:1
 ```
 
 That writes `./tokens/YOUR_ORG.token`.
@@ -130,7 +130,7 @@ availableSecrets:
 
 steps:
   - id: 'gh-token'
-    name: 'ghcr.io/o8bit/gh-app-token:sha-ecbac13'
+    name: 'ghcr.io/o8bit/gh-app-token:1'
     env:
       - 'GITHUB_APP_ID=123456'
       - 'GITHUB_APP_ORGS=YOUR_ORG'
@@ -227,7 +227,7 @@ The suite ships inside the image, so you can run it against the exact artefact
 you pull:
 
 ```sh
-docker run --rm --entrypoint sh ghcr.io/o8bit/gh-app-token:sha-ecbac13 \
+docker run --rm --entrypoint sh ghcr.io/o8bit/gh-app-token:1 \
   /usr/local/bin/gh-app-token-test.sh
 ```
 
@@ -237,7 +237,19 @@ parsing and output paths.
 
 ## Image tags
 
-| Tag | |
-|---|---|
-| `sha-<short>` | immutable, built from that commit. **Pin this.** |
-| `latest` | moves with `main` |
+Releases are semver, cut by pushing a `vX.Y.Z` git tag. Each release publishes
+four tags:
+
+| Tag | Moves? | Use when |
+|---|---|---|
+| `1.2.3` | never | you want the exact image, forever |
+| `1.2` | picks up patches | **the usual choice** |
+| `1` | picks up features and patches, never breaking changes | you want fixes without touching config |
+| `latest` | anything, including breaking changes | never, in a build |
+
+Breaking changes to the environment interface or output layout go in a new
+major: `2.0.0`, reachable as `:2`. A consumer pinned to `:1` will not be moved
+onto it.
+
+Pushes to `main` build and test but publish nothing, so a release stays a
+deliberate act.
