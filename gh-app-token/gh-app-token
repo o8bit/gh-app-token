@@ -1,0 +1,213 @@
+#!/bin/sh
+# Mints GitHub App installation tokens and writes one file per account.
+#
+# GitHub Apps are exempt from SAML SSO enforcement; user-scoped credentials
+# (personal access tokens, OAuth grants, user SSH keys) are not. In an
+# enterprise with SAML enforced, that exemption is the entire reason this
+# exists.
+#
+# This tool ONLY mints tokens. It does not configure git, Composer, Go modules
+# or anything else - the caller applies the token wherever it needs it. Earlier
+# versions of this script grew per-language outputs and were forked as a direct
+# result; resist adding them back.
+#
+# Usage: gh-app-token
+#
+# Environment:
+#   GITHUB_APP_PRIVATE_KEY  Required. The App private key, as a raw PEM or a
+#                           base64-encoded PEM. Base64 exists because some CI
+#                           systems mangle multi-line values.
+#   GITHUB_APP_ID           Required. Not secret.
+#   GITHUB_APP_ORGS         Required. Comma-separated account names, e.g.
+#                           "org-a,org-b". Installation ids are resolved
+#                           from the names: an App installs at most once per
+#                           account, so the mapping is 1:1, and the lookup is
+#                           authenticated with the App JWT so it can only return
+#                           this App's installation. Names survive a reinstall;
+#                           installation ids do not.
+#   GITHUB_APP_TOKEN_DIR    Required. Directory for the token files. Created at
+#                           mode 0700 if absent. Prefer a directory that does
+#                           not outlive the step that needs it - in Cloud Build,
+#                           /workspace persists across steps, so a token left
+#                           there is readable by every later step.
+#   GITHUB_APP_PERMISSIONS  Optional JSON, applied to every account.
+#                           Default {"contents":"read"}. Requesting a permission
+#                           the installation does not grant fails with 422.
+#
+# Writes $GITHUB_APP_TOKEN_DIR/<name>.token per account, mode 0600.
+#
+# The token is never printed. Installation tokens expire after one hour.
+#
+# POSIX sh. Requires openssl, curl and jq.
+set -eu
+
+GHAT_API='https://api.github.com'
+GHAT_DEFAULT_PERMISSIONS='{"contents":"read"}'
+GHAT_USER_AGENT='gh-app-token'
+
+ghat_fail() { printf 'gh-app-token: %s\n' "$1" >&2; exit 1; }
+ghat_log() { printf 'gh-app-token: %s\n' "$1"; }
+
+# base64url from stdin: strip padding and newlines, translate the alphabet.
+ghat_b64u() { base64 | tr -d '\n=' | tr '+/' '-_'; }
+
+# One account name per line, from a comma-separated list. All whitespace is
+# stripped so "a, b" and "a,b" behave the same, and blank entries (a trailing
+# comma) are dropped.
+ghat_orgs() {
+  printf '%s\n' "$1" | tr ',' '\n' | sed 's/[[:space:]]//g' | grep -v '^$' || true
+}
+
+ghat_token_path() { printf '%s/%s.token' "${1%/}" "$2"; }
+
+# Writes the PEM to $1, accepting a raw PEM or a base64-encoded PEM.
+ghat_write_key() {
+  _dest="$1"
+  : >"$_dest"
+  chmod 600 "$_dest"
+  case "$GITHUB_APP_PRIVATE_KEY" in
+    -----BEGIN*) printf '%s\n' "$GITHUB_APP_PRIVATE_KEY" >"$_dest" ;;
+    # base64 -d exit codes on invalid input differ between busybox, GNU and BSD,
+    # so it cannot gate this - the openssl check below is the real one.
+    *) printf '%s' "$GITHUB_APP_PRIVATE_KEY" | tr -d '\n' | base64 -d >"$_dest" 2>/dev/null || : ;;
+  esac
+  openssl rsa -in "$_dest" -noout -check >/dev/null 2>&1 \
+    || ghat_fail 'GITHUB_APP_PRIVATE_KEY is not a valid RSA private key (expected a PEM, or base64 of one)'
+}
+
+# RS256 JWT. GitHub caps App JWT lifetime at 10 minutes and rejects a future
+# iat, so exp is 9 minutes out and iat is backdated 60s for clock skew.
+ghat_jwt() {
+  _keyfile="$1"; _appid="$2"; _now="$3"
+  _header=$(printf '%s' '{"alg":"RS256","typ":"JWT"}' | ghat_b64u)
+  _claims=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "$((_now - 60))" "$((_now + 540))" "$_appid" | ghat_b64u)
+  _sigfile="$_keyfile.sig"
+  if ! printf '%s' "$_header.$_claims" | openssl dgst -sha256 -sign "$_keyfile" -binary >"$_sigfile"; then
+    rm -f "$_sigfile"
+    ghat_fail 'signing the App JWT failed'
+  fi
+  [ -s "$_sigfile" ] || { rm -f "$_sigfile"; ghat_fail 'signing the App JWT produced an empty signature'; }
+  _sig=$(ghat_b64u <"$_sigfile")
+  rm -f "$_sigfile"
+  printf '%s.%s.%s' "$_header" "$_claims" "$_sig"
+}
+
+# Written with a restrictive mode before the token reaches it, so it is never
+# briefly world-readable with contents.
+ghat_write_token() {
+  _dest="$1"; _tok="$2"
+  : >"$_dest"
+  chmod 600 "$_dest"
+  printf '%s' "$_tok" >"$_dest"
+}
+
+# GET $1 with bearer/token auth $2, body to $_tmp/body.json, echoing the status.
+ghat_get() {
+  curl -sS -o "$_tmp/body.json" -w '%{http_code}' \
+    -H "Authorization: $2" \
+    -H 'Accept: application/vnd.github+json' \
+    -H 'X-GitHub-Api-Version: 2022-11-28' \
+    -H "User-Agent: $GHAT_USER_AGENT" \
+    "$GHAT_API/$1" >"$_tmp/body.code" 2>"$_tmp/curl.err" \
+    || ghat_fail "GET $1 failed: $(cat "$_tmp/curl.err")"
+}
+
+# Resolves an account name to this App's installation id. Tries the org
+# endpoint, then the user endpoint, because an App can be installed on a
+# personal account as well as an org.
+ghat_installation_id() {
+  _jwt="$1"; _name="$2"
+  for _path in "orgs/$_name/installation" "users/$_name/installation"; do
+    ghat_get "$_path" "Bearer $_jwt"
+    _code=$(cat "$_tmp/body.code")
+    if [ "$_code" = '200' ]; then
+      jq -er '.id' <"$_tmp/body.json" 2>/dev/null && return 0
+      ghat_fail "the installation response for '$_name' contained no id"
+    fi
+    if [ "$_code" != '404' ]; then
+      ghat_fail "installation lookup for '$_name' returned HTTP $_code: $(jq -r '.message // ""' <"$_tmp/body.json")"
+    fi
+  done
+  ghat_fail "app $GITHUB_APP_ID is not installed on '$_name' (tried both org and user)"
+}
+
+ghat_main() {
+  [ -n "${GITHUB_APP_PRIVATE_KEY:-}" ] || ghat_fail 'GITHUB_APP_PRIVATE_KEY is not set'
+  [ -n "${GITHUB_APP_ID:-}" ] || ghat_fail 'GITHUB_APP_ID is not set'
+  [ -n "${GITHUB_APP_ORGS:-}" ] || ghat_fail 'GITHUB_APP_ORGS is not set'
+  [ -n "${GITHUB_APP_TOKEN_DIR:-}" ] || ghat_fail 'GITHUB_APP_TOKEN_DIR is not set'
+  _perms="${GITHUB_APP_PERMISSIONS:-$GHAT_DEFAULT_PERMISSIONS}"
+
+  for _cmd in openssl curl jq; do
+    command -v "$_cmd" >/dev/null 2>&1 || ghat_fail "$_cmd is required but not on PATH"
+  done
+
+  _names=$(ghat_orgs "$GITHUB_APP_ORGS")
+  [ -n "$_names" ] || ghat_fail 'GITHUB_APP_ORGS contained no account names'
+
+  mkdir -p "$GITHUB_APP_TOKEN_DIR"
+  chmod 700 "$GITHUB_APP_TOKEN_DIR"
+
+  _tmp=$(mktemp -d)
+  trap 'rm -rf "$_tmp"' EXIT
+  trap 'rm -rf "$_tmp"; exit 130' INT TERM
+  ghat_write_key "$_tmp/key.pem"
+
+  # One JWT serves every account: it is valid for 9 minutes, far longer than a
+  # handful of API calls.
+  _jwt=$(ghat_jwt "$_tmp/key.pem" "$GITHUB_APP_ID" "$(date +%s)")
+
+  # A `while read` on the right of a pipe runs in a subshell, where ghat_fail's
+  # exit would only end the subshell and the loop would continue to the next
+  # account. Splitting on newlines into positionals keeps this in the current
+  # shell so the first failure stops everything.
+  _old_ifs=$IFS
+  IFS='
+'
+  # Deliberately unquoted: IFS is a newline, so each name becomes one positional.
+  # shellcheck disable=SC2086
+  set -- $_names
+  IFS=$_old_ifs
+
+  for _name in "$@"; do
+
+    _inst=$(ghat_installation_id "$_jwt" "$_name")
+
+    _code=$(curl -sS -X POST -o "$_tmp/mint.json" -w '%{http_code}' \
+      -H "Authorization: Bearer $_jwt" \
+      -H 'Accept: application/vnd.github+json' \
+      -H 'X-GitHub-Api-Version: 2022-11-28' \
+      -H "User-Agent: $GHAT_USER_AGENT" \
+      -H 'Content-Type: application/json' \
+      -d "{\"permissions\":$_perms}" \
+      "$GHAT_API/app/installations/$_inst/access_tokens" 2>"$_tmp/curl.err") \
+      || ghat_fail "mint request for '$_name' failed: $(cat "$_tmp/curl.err")"
+    [ "$_code" = '201' ] \
+      || ghat_fail "token mint for '$_name' failed (HTTP $_code): $(jq -r '.message // ""' <"$_tmp/mint.json") - app $GITHUB_APP_ID, installation $_inst, requested $_perms"
+
+    _token=$(jq -er '.token' <"$_tmp/mint.json") \
+      || ghat_fail "the mint response for '$_name' contained no token"
+    _expires=$(jq -r '.expires_at // "unknown"' <"$_tmp/mint.json")
+
+    # Confirms the token reaches something. A mint can succeed while the
+    # installation covers no repositories - wrong account, App removed from all
+    # repos, or repository_selection narrowed - which would otherwise surface as
+    # a confusing 404 inside the caller's build.
+    _vcode=$(curl -sS -o "$_tmp/repos.json" -w '%{http_code}' \
+      -H "Authorization: token $_token" \
+      -H 'Accept: application/vnd.github+json' \
+      -H "User-Agent: $GHAT_USER_AGENT" \
+      "$GHAT_API/installation/repositories?per_page=1" 2>"$_tmp/curl.err") \
+      || ghat_fail "verification request for '$_name' failed: $(cat "$_tmp/curl.err")"
+    [ "$_vcode" = '200' ] \
+      || ghat_fail "the token for '$_name' cannot list its repositories (HTTP $_vcode)"
+    [ "$(jq -r '.total_count // 0' <"$_tmp/repos.json")" -gt 0 ] 2>/dev/null \
+      || ghat_fail "the installation for '$_name' has no accessible repositories"
+
+    _dest=$(ghat_token_path "$GITHUB_APP_TOKEN_DIR" "$_name")
+    ghat_write_token "$_dest" "$_token"
+    ghat_log "$_name: installation $_inst, expires $_expires, token written to $_dest"
+  done
+}
+
+[ -n "${GHAT_SKIP_MAIN:-}" ] || ghat_main "$@"
