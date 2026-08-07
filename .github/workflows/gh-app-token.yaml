@@ -1,0 +1,62 @@
+name: gh-app-token
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'gh-app-token/**'
+      - '.github/workflows/gh-app-token.yaml'
+  pull_request:
+    paths:
+      - 'gh-app-token/**'
+      - '.github/workflows/gh-app-token.yaml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Publishing to ghcr.io/o8bit/* works with the built-in GITHUB_TOKEN only
+      # because this repo is in the o8bit org, so the package namespace matches
+      # the workflow's own owner.
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build the image
+        run: docker build -t gh-app-token:ci gh-app-token/
+
+      - name: Run the test suite inside the built image
+        run: |
+          docker run --rm --entrypoint sh gh-app-token:ci \
+            /usr/local/bin/gh-app-token-test.sh
+
+      - name: Confirm the image carries no token-consuming tooling
+        run: |
+          docker run --rm --entrypoint sh gh-app-token:ci -c '
+            for b in openssl curl jq; do
+              command -v "$b" >/dev/null || { echo "MISSING: $b"; exit 1; }
+            done
+            for b in git php composer gh; do
+              if command -v "$b" >/dev/null; then echo "unexpectedly present: $b"; exit 1; fi
+            done
+            echo "dependencies as intended"'
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        if: github.event_name != 'pull_request'
+        run: |
+          SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
+          docker tag gh-app-token:ci "ghcr.io/o8bit/gh-app-token:sha-$SHORT"
+          docker tag gh-app-token:ci ghcr.io/o8bit/gh-app-token:latest
+          docker push "ghcr.io/o8bit/gh-app-token:sha-$SHORT"
+          docker push ghcr.io/o8bit/gh-app-token:latest
+          echo "published ghcr.io/o8bit/gh-app-token:sha-$SHORT"
