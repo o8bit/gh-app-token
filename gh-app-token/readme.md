@@ -32,7 +32,7 @@ docker run --rm \
   -e GITHUB_APP_ID=123456 \
   -e GITHUB_APP_ORGS=YOUR_ORG \
   -e GITHUB_APP_TOKEN_DIR=/tokens \
-  ghcr.io/o8bit/gh-app-token:sha-151f5db
+  ghcr.io/o8bit/gh-app-token:sha-9a736de
 ```
 
 That writes `./tokens/YOUR_ORG.token`.
@@ -130,7 +130,7 @@ availableSecrets:
 
 steps:
   - id: 'gh-token'
-    name: 'ghcr.io/o8bit/gh-app-token:sha-151f5db'
+    name: 'ghcr.io/o8bit/gh-app-token:sha-9a736de'
     env:
       - 'GITHUB_APP_ID=123456'
       - 'GITHUB_APP_ORGS=YOUR_ORG'
@@ -227,7 +227,7 @@ The suite ships inside the image, so you can run it against the exact artefact
 you pull:
 
 ```sh
-docker run --rm --entrypoint sh ghcr.io/o8bit/gh-app-token:sha-151f5db \
+docker run --rm --entrypoint sh ghcr.io/o8bit/gh-app-token:sha-9a736de \
   /usr/local/bin/gh-app-token-test.sh
 ```
 
