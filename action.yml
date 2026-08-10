@@ -1,0 +1,75 @@
+name: 'gh-app-token'
+description: >-
+  Mints GitHub App installation access tokens and writes one file per account.
+  Mints only - applying the token is the caller's job.
+
+inputs:
+  app-id:
+    description: >-
+      The App's id, or its client id. Either works: the value is used only as the
+      JWT issuer, and GitHub accepts both.
+    required: true
+  private-key:
+    description: "The App's private key, as a raw PEM or a base64-encoded PEM."
+    required: true
+  orgs:
+    description: >-
+      Comma-separated accounts to mint a token for. The App must be installed on
+      every one of them - the tool stops at the first account it cannot resolve
+      and does not mint the remainder.
+    required: true
+  permissions:
+    description: >-
+      JSON permission set to request, applied to every account, e.g.
+      {"contents":"read"} or {"actions":"write"}. Defaults to the tool's own
+      default of {"contents":"read"}. You can only narrow, never widen:
+      requesting a permission the installation was not granted fails with 422.
+    required: false
+    default: ''
+  token-dir:
+    description: >-
+      Where to write the <account>.token files. Defaults to a directory under
+      RUNNER_TEMP, which is outside the workspace and cleaned up with the job.
+    required: false
+    default: ''
+
+outputs:
+  token-dir:
+    description: 'Directory holding one <account>.token file per account, mode 0600.'
+    value: ${{ steps.mint.outputs.token-dir }}
+
+runs:
+  using: composite
+  steps:
+    # The script is run directly rather than through the published image. Runners
+    # already have curl, jq, openssl and base64, so there is nothing to install,
+    # nothing to pull, and no container writing root-owned 0600 files that the
+    # runner user then cannot read.
+    - id: mint
+      shell: bash
+      env:
+        GITHUB_APP_ID: ${{ inputs.app-id }}
+        GITHUB_APP_PRIVATE_KEY: ${{ inputs.private-key }}
+        GITHUB_APP_ORGS: ${{ inputs.orgs }}
+        # An empty value is safe: the tool falls back to its own default.
+        GITHUB_APP_PERMISSIONS: ${{ inputs.permissions }}
+        TOKEN_DIR_INPUT: ${{ inputs.token-dir }}
+      run: |
+        set -eu
+        GITHUB_APP_TOKEN_DIR="${TOKEN_DIR_INPUT:-${RUNNER_TEMP}/gh-app-token}"
+        export GITHUB_APP_TOKEN_DIR
+        sh "${GITHUB_ACTION_PATH}/gh-app-token"
+
+        # Action outputs are masked for you; a token read out of a file is not.
+        # Mask every one now, so a later step that echoes one cannot leak it.
+        #
+        # The trailing newline matters. Without it `read` hits EOF on the last
+        # field and the loop body never runs for it, so the last account's token
+        # would go unmasked - which is exactly the leak this loop exists to stop.
+        printf '%s\n' "$GITHUB_APP_ORGS" | tr ',' '\n' | while read -r account; do
+          account="$(printf '%s' "$account" | tr -d '[:space:]')"
+          [ -n "$account" ] || continue
+          printf '::add-mask::%s\n' "$(cat "${GITHUB_APP_TOKEN_DIR}/${account}.token")"
+        done
+
+        printf 'token-dir=%s\n' "$GITHUB_APP_TOKEN_DIR" >>"$GITHUB_OUTPUT"

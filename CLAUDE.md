@@ -24,7 +24,9 @@ tells consumers to use `http-basic`.
 world-readable for an instant. The token dir is `mkdir -p` + `chmod 700`.
 
 **Mint only.** Do not add per-language output — no `auth.json`, no gitconfig, no
-`GITHUB_TOKEN` export. Applying a token is the caller's job. Earlier versions
+`GITHUB_TOKEN` export. Applying a token is the caller's job. This binds
+`action.yml` too: it mints, masks, and reports a directory, and deliberately does
+not configure git for you. Earlier versions
 grew those outputs and were forked into every consuming repo as a result;
 undoing that is the entire point of this repo existing. megameld's
 `build/composer-auth.sh` is what an "apply" step looks like, and it lives there,
@@ -67,9 +69,17 @@ asserting a value against itself passes forever and proves nothing.
 
 ## Releasing
 
-Push a `vX.Y.Z` tag (via `gh release create`). That publishes `X.Y.Z`, `X.Y`,
-`X` and `latest`. Pushes to `main` and pull requests build and test but publish
-nothing, so a release stays deliberate.
+Push a `vX.Y.Z` tag (via `gh release create`). That publishes docker tags
+`X.Y.Z`, `X.Y`, `X` and `latest`, **and moves the `v<major>` git tag** that
+composite-Action consumers pin to. Pushes to `main` and pull requests build and
+test but publish nothing, so a release stays deliberate.
+
+Testing and publishing are **separate jobs on purpose**. `test` runs on every
+event and is read-only; `publish` runs only on a version tag and is the only job
+holding `packages: write` and `contents: write`. Keep it that way — merging them
+would hand a repo-writable token to every pull request run. `contents: write`
+there is the workflow's own repo-scoped `GITHUB_TOKEN`, nothing to do with the
+App's installation permissions, which must never gain `contents:write`.
 
 Any change to an environment variable name, a default, or the output path is
 **breaking** — new major, `2.0.0`, reachable as `:2`. Consumers pinned to `:1`
@@ -81,19 +91,22 @@ a glob: `[0-9]*.[0-9]*.[0-9]*` looks like validation but `*` matches anything, s
 
 ## Distribution
 
-The repo is **private**; the GHCR package is **public**. Org settings disable
-public and internal repo visibility, and package visibility is configured
-separately. A public package matters because this tool produces the credential
-builds need — requiring a credential to fetch it would be circular.
+Both the repo and the GHCR package are **public**. That matters because this tool
+produces the credential builds need — requiring a credential to fetch it would be
+circular — and because consumers span several orgs, so a public repo is also what
+makes `uses: o8bit/gh-app-token@v1` resolve without an Actions access policy.
 
-Two consequences:
+Consequences:
 
-- The image is pulled anonymously by CI in other orgs. Don't add anything that
-  assumes a GitHub login.
-- Anonymous pullers **cannot** read this repo, so the `image.documentation`
-  label and the "see the README" text in `image.description` point somewhere
-  they can't reach. Worth fixing by moving the reference documentation into the
-  labels or a public location; don't add more pointers to it meanwhile.
+- The image is pulled, and the action resolved, anonymously by CI in other orgs.
+  Don't add anything that assumes a GitHub login.
+- **This is a public repo. Everything committed here is world-readable**, including
+  comments naming consumer repositories and infrastructure. Nothing secret has
+  ever been committed — the only key-shaped strings in history are a truncated
+  dummy PEM and a fake `ghs_` literal in the test suite. Keep it that way: no real
+  ids, hosts, or project names that would not be published deliberately.
+- The `image.documentation` label now resolves for anonymous pullers, which it did
+  not while the repo was private.
 
 The repo is flattened to the root because GHCR renders only the linked repo's
 root `readme.md` — there is no subdirectory support. Don't reintroduce a
@@ -115,4 +128,13 @@ Two runner behaviours that constrain how it can be invoked:
   persists, so the token dir goes there — and is then readable by every later
   step in the build.
 
-GitHub Actions should use `actions/create-github-app-token` instead of this.
+- **GitHub Actions** consumes `action.yml` at `o8bit/gh-app-token@v1`, which runs
+  the script on the runner rather than pulling the image. That path needs the
+  repo's Actions access policy set to `enterprise`, because this repo is private
+  and the consumers sit in other orgs of the enterprise — check with
+  `gh api repos/o8bit/gh-app-token/actions/permissions/access`. It also needs the
+  moving `v1` git tag, which the publish job maintains.
+
+  `actions/create-github-app-token` is the simpler choice for a single org and is
+  worth recommending there. It mints per owner, so a workflow needing three orgs
+  needs three invocations — that is the case this action exists for.

@@ -15,9 +15,9 @@ moment its SSO authorisation lapses, and takes every build with it.
 ghcr.io/o8bit/gh-app-token
 ```
 
-The image is public — no authentication is needed to pull it. That is
-deliberate: this tool produces GitHub credentials, so it must not require one to
-fetch.
+The image and this repository are both public — no authentication is needed to
+pull the image or to use the action. That is deliberate: this tool produces
+GitHub credentials, so it must not require one to fetch.
 
 ## Usage
 
@@ -163,9 +163,41 @@ somewhere that does not outlive it.
 
 ## GitHub Actions
 
-Don't use this. Actions has
+Use it as a composite action rather than the image:
+
+```yaml
+- uses: o8bit/gh-app-token@v1
+  id: gh-token
+  with:
+    app-id: ${{ secrets.APP_ID }}
+    private-key: ${{ secrets.APP_PRIVATE_KEY }}
+    orgs: org-a,org-b
+
+- name: Fetch private modules
+  env:
+    TOKEN_DIR: ${{ steps.gh-token.outputs.token-dir }}
+  run: |
+    git config --global \
+      "url.https://x-access-token:$(cat "$TOKEN_DIR/org-a.token")@github.com/org-a/.insteadOf" \
+      "https://github.com/org-a/"
+```
+
+`app-id` takes the App's id **or** its client id — the value is only the JWT
+issuer, and GitHub accepts either. `permissions` and `token-dir` are optional;
+`token-dir` defaults to a directory under `RUNNER_TEMP`, outside the workspace.
+
+The action runs the script directly rather than pulling the image. Runners
+already have `curl`, `jq`, `openssl` and `base64`, so there is nothing to
+install, nothing to pull, and no container writing root-owned `0600` files that
+the runner user then cannot read.
+
+**Every minted token is masked** with `::add-mask::` before the action returns.
+Action outputs are masked for you; a token read out of a file is not.
+
 [`actions/create-github-app-token`](https://github.com/actions/create-github-app-token)
-built in, which does the same job with less ceremony.
+is the obvious alternative, and is simpler if you need one org. It mints per
+owner, so three orgs means three invocations and three separate rewrites — that
+case is what this action is for.
 
 ## Using the token
 
@@ -251,5 +283,11 @@ Breaking changes to the environment interface or output layout go in a new
 major: `2.0.0`, reachable as `:2`. A consumer pinned to `:1` will not be moved
 onto it.
 
-Pushes to `main` build and test but publish nothing, so a release stays a
-deliberate act.
+Pushes to `main` and pull requests build and test but publish nothing, so a
+release stays a deliberate act. Testing and publishing are separate jobs: only
+the publish job, which runs on a version tag, holds the credentials that can push
+an image or move a tag.
+
+A release also **moves the `v<major>` git tag**, because composite-Action
+consumers pin a git ref (`@v1`) rather than a docker tag. Docker `1.2.3` and git
+`v1.2.3` are immutable; docker `1`, `1.2`, `latest` and git `v1` all move.
