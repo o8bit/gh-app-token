@@ -207,7 +207,16 @@ want depends on how many accounts you need and what is consuming the token.
 | Consumer | One account | Several accounts |
 |---|---|---|
 | git, Go modules, submodules | `.netrc` | `insteadOf` per account |
+| npm, dependency from a git URL | `.netrc` | `insteadOf` per account |
 | Composer | `auth.json` `http-basic` | `auth.json` **plus** git `insteadOf` |
+| npm, package from GitHub Packages | `.npmrc` `_authToken` | one token per registry host |
+
+The split is not per tool, it is per fetch path. Anything that resolves through
+git — Go modules, npm dependencies given as `github:org/repo` or a `git+https`
+URL, submodules — inherits whatever git is configured with and needs no
+mechanism of its own. Anything with its own registry client — Composer, or npm
+against GitHub Packages — authenticates from its own file and ignores git's
+configuration entirely.
 
 ### git and Go — one account: .netrc
 
