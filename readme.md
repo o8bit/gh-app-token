@@ -201,9 +201,40 @@ case is what this action is for.
 
 ## Using the token
 
-### git, and anything built on it (Go modules, submodules)
+Applying a token is the caller's job — this tool only mints. Which method you
+want depends on how many accounts you need and what is consuming the token.
 
-Rewrite per account — several accounts can coexist:
+| Consumer | One account | Several accounts |
+|---|---|---|
+| git, Go modules, submodules | `.netrc` | `insteadOf` per account |
+| Composer | `auth.json` `http-basic` | `auth.json` **plus** git `insteadOf` |
+
+### git and Go — one account: .netrc
+
+Keeps the token out of git config entirely, so it cannot reach a log through
+`git config --list`, a printed remote, or a gitconfig kept as a build artefact:
+
+```sh
+: >~/.netrc && chmod 600 ~/.netrc          # create and restrict, then write
+printf 'machine github.com login x-access-token password %s\n' \
+  "$(cat /tokens/org-a.token)" >~/.netrc
+```
+
+Write it, do not append: a second `>>` leaves two `machine github.com` lines and
+the **stale one wins**, so a build silently keeps using an expired token.
+
+If your manifests use `git@github.com:` URLs, you still need a rewrite — but it
+carries no secret, so it is safe to log:
+
+```sh
+git config --global url."https://github.com/org-a/".insteadOf "git@github.com:org-a/"
+```
+
+### git and Go — several accounts: insteadOf
+
+`.netrc` matches on **host**, and every account is `github.com`, so it can hold
+only one token. Installation tokens are per account, so anything spanning
+accounts has to use a rewrite:
 
 ```sh
 for org in org-a org-b; do
@@ -220,6 +251,11 @@ internally.
 
 ### Composer
 
+Composer does **not** read `.netrc`. Its HTTP client authenticates from
+`auth.json` (or `COMPOSER_AUTH`) only, so netrc is not an option here even for a
+single account — without `auth.json` Composer hits the GitHub API
+unauthenticated and falls back to cloning.
+
 Use `http-basic`, **not** `github-oauth`:
 
 ```json
@@ -231,9 +267,20 @@ rejects hyphens — and installation tokens contain them. Worse, the exception
 prints the rejected token into the build log. `http-basic` has no such
 validation and works on every Composer version.
 
-Composer holds one credential per host, so `auth.json` can serve only **one**
-account. A project with private dependencies in several orgs needs its git
-`insteadOf` rules to do the work instead.
+`auth.json` also holds one credential per host, so it serves one account. A
+project with private dependencies in several accounts needs git `insteadOf`
+rules alongside it.
+
+### What none of these fix
+
+Whichever method you pick, the token is an argument to the command that writes
+it. Any shell tracing — `set -x`, or a CI that echoes commands before running
+them — prints that command, token included. Turn tracing off around the step
+rather than assuming the method protects you.
+
+`curl` does not read `.netrc` unless you pass `--netrc`, so API calls need the
+token given to them explicitly. `gh` reads `GITHUB_TOKEN` from the environment
+and ignores both methods.
 
 ## Treat tokens as opaque
 
