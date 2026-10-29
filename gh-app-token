@@ -1,5 +1,6 @@
 #!/bin/sh
-# Mints GitHub App installation tokens and writes one file per account.
+# Mints GitHub App installation tokens limited to the named repositories, and
+# writes one file per owner.
 #
 # GitHub Apps are exempt from SAML SSO enforcement; user-scoped credentials
 # (personal access tokens, OAuth grants, user SSH keys) are not. In an
@@ -18,10 +19,13 @@
 #                           base64-encoded PEM. Base64 exists because some CI
 #                           systems mangle multi-line values.
 #   GITHUB_APP_ID           Required. Not secret.
-#   GITHUB_APP_ORGS         Required. Comma-separated account names, e.g.
-#                           "org-a,org-b". Installation ids are resolved
-#                           from the names: an App installs at most once per
-#                           account, so the mapping is 1:1, and the lookup is
+#   GITHUB_APP_REPOSITORIES Required. Comma-separated owner/repo entries, e.g.
+#                           "org-a/lib,org-a/app,org-b/sdk". One token is minted
+#                           per owner, limited to that owner's named
+#                           repositories. owner/* mints for every repository the
+#                           installation covers. Installation ids are resolved
+#                           from the owner names: an App installs at most once
+#                           per account, so the mapping is 1:1, and the lookup is
 #                           authenticated with the App JWT so it can only return
 #                           this App's installation. Names survive a reinstall;
 #                           installation ids do not.
@@ -30,11 +34,11 @@
 #                           not outlive the step that needs it - in Cloud Build,
 #                           /workspace persists across steps, so a token left
 #                           there is readable by every later step.
-#   GITHUB_APP_PERMISSIONS  Optional JSON, applied to every account.
+#   GITHUB_APP_PERMISSIONS  Optional JSON object, applied to every owner.
 #                           Default {"contents":"read"}. Requesting a permission
 #                           the installation does not grant fails with 422.
 #
-# Writes $GITHUB_APP_TOKEN_DIR/<name>.token per account, mode 0600.
+# Writes $GITHUB_APP_TOKEN_DIR/<owner>.token per owner, mode 0600.
 #
 # The token is never printed. Installation tokens expire after one hour.
 #
@@ -51,11 +55,74 @@ ghat_log() { printf 'gh-app-token: %s\n' "$1"; }
 # base64url from stdin: strip padding and newlines, translate the alphabet.
 ghat_b64u() { base64 | tr -d '\n=' | tr '+/' '-_'; }
 
-# One account name per line, from a comma-separated list. All whitespace is
-# stripped so "a, b" and "a,b" behave the same, and blank entries (a trailing
-# comma) are dropped.
-ghat_orgs() {
+# One owner/repo entry per line, from a comma-separated list. All whitespace is
+# stripped so "a/x, b/y" and "a/x,b/y" behave the same, and blank entries (a
+# trailing comma) are dropped.
+ghat_repositories() {
   printf '%s\n' "$1" | tr ',' '\n' | sed 's/[[:space:]]//g' | grep -v '^$' || true
+}
+
+# Fails unless every argument is owner/repo or owner/*. The names go into the
+# JSON request body, so the character set is checked here. owner/* alongside a
+# named repository of the same owner fails too: the * already covers it, so the
+# list would read narrower than the token it mints.
+ghat_validate_repositories() {
+  for _entry in "$@"; do
+    case "$_entry" in
+      */*/* | /* | */) ghat_fail "'$_entry' is not owner/repo" ;;
+      */*) ;;
+      *) ghat_fail "'$_entry' is not owner/repo" ;;
+    esac
+    _owner=${_entry%%/*}
+    _repo=${_entry#*/}
+    case "$_owner" in *[!A-Za-z0-9-]*) ghat_fail "'$_entry' has an invalid owner name" ;; esac
+    if [ "$_repo" != '*' ]; then
+      case "$_repo" in *[!A-Za-z0-9._-]*) ghat_fail "'$_entry' has an invalid repository name" ;; esac
+    fi
+  done
+  for _entry in "$@"; do
+    [ "${_entry#*/}" = '*' ] || continue
+    _owner=${_entry%%/*}
+    for _other in "$@"; do
+      if [ "${_other%%/*}" = "$_owner" ] && [ "$_other" != "$_owner/*" ]; then
+        ghat_fail "'$_owner/*' cannot be combined with named repositories of '$_owner'"
+      fi
+    done
+  done
+}
+
+# The distinct owners of the given owner/repo entries, one per line, in the
+# order they first appear.
+ghat_owners() {
+  _seen=' '
+  for _entry in "$@"; do
+    _owner=${_entry%%/*}
+    case "$_seen" in
+      *" $_owner "*) ;;
+      *) _seen="$_seen$_owner "; printf '%s\n' "$_owner" ;;
+    esac
+  done
+}
+
+# The repository names requested for owner $1, one per line, from the
+# owner/repo entries that follow. A lone * means every repository.
+ghat_owner_repos() {
+  _want="$1"; shift
+  for _entry in "$@"; do
+    [ "${_entry%%/*}" = "$_want" ] && printf '%s\n' "${_entry#*/}"
+  done
+  return 0
+}
+
+# The mint request body: the permissions in $1, limited to the newline-separated
+# repository names in $2 unless $2 is *.
+ghat_mint_body() {
+  if [ "$2" = '*' ]; then
+    jq -nc --argjson p "$1" '{permissions: $p}'
+  else
+    jq -nc --argjson p "$1" --arg r "$2" \
+      '{permissions: $p, repositories: ($r | split("\n") | map(select(. != "")))}'
+  fi
 }
 
 ghat_token_path() { printf '%s/%s.token' "${1%/}" "$2"; }
@@ -132,9 +199,13 @@ ghat_installation_id() {
 }
 
 ghat_main() {
+  # Set but ignored would mint tokens with a scope the caller did not write, so
+  # a configuration still carrying it stops here.
+  [ -z "${GITHUB_APP_ORGS:-}" ] \
+    || ghat_fail 'GITHUB_APP_ORGS was replaced by GITHUB_APP_REPOSITORIES in v2: list owner/repo entries, or owner/* for every repository'
   [ -n "${GITHUB_APP_PRIVATE_KEY:-}" ] || ghat_fail 'GITHUB_APP_PRIVATE_KEY is not set'
   [ -n "${GITHUB_APP_ID:-}" ] || ghat_fail 'GITHUB_APP_ID is not set'
-  [ -n "${GITHUB_APP_ORGS:-}" ] || ghat_fail 'GITHUB_APP_ORGS is not set'
+  [ -n "${GITHUB_APP_REPOSITORIES:-}" ] || ghat_fail 'GITHUB_APP_REPOSITORIES is not set'
   [ -n "${GITHUB_APP_TOKEN_DIR:-}" ] || ghat_fail 'GITHUB_APP_TOKEN_DIR is not set'
   _perms="${GITHUB_APP_PERMISSIONS:-$GHAT_DEFAULT_PERMISSIONS}"
 
@@ -142,8 +213,27 @@ ghat_main() {
     command -v "$_cmd" >/dev/null 2>&1 || ghat_fail "$_cmd is required but not on PATH"
   done
 
-  _names=$(ghat_orgs "$GITHUB_APP_ORGS")
-  [ -n "$_names" ] || ghat_fail 'GITHUB_APP_ORGS contained no account names'
+  printf '%s' "$_perms" | jq -e 'type == "object"' >/dev/null 2>&1 \
+    || ghat_fail 'GITHUB_APP_PERMISSIONS is not a JSON object'
+
+  _entries=$(ghat_repositories "$GITHUB_APP_REPOSITORIES")
+  [ -n "$_entries" ] || ghat_fail 'GITHUB_APP_REPOSITORIES contained no repositories'
+
+  # A `while read` on the right of a pipe runs in a subshell, where ghat_fail's
+  # exit would only end the subshell and the loop would continue to the next
+  # owner. Splitting on newlines into positionals keeps this in the current
+  # shell so the first failure stops everything. Globbing is off for the split:
+  # owner/* would otherwise expand against the working directory.
+  _old_ifs=$IFS
+  IFS='
+'
+  set -f
+  # Deliberately unquoted: IFS is a newline, so each entry becomes one positional.
+  # shellcheck disable=SC2086
+  set -- $_entries
+  set +f
+  IFS=$_old_ifs
+  ghat_validate_repositories "$@"
 
   mkdir -p "$GITHUB_APP_TOKEN_DIR"
   chmod 700 "$GITHUB_APP_TOKEN_DIR"
@@ -153,23 +243,22 @@ ghat_main() {
   trap 'rm -rf "$_tmp"; exit 130' INT TERM
   ghat_write_key "$_tmp/key.pem"
 
-  # One JWT serves every account: it is valid for 9 minutes, far longer than a
+  # One JWT serves every owner: it is valid for 9 minutes, far longer than a
   # handful of API calls.
   _jwt=$(ghat_jwt "$_tmp/key.pem" "$GITHUB_APP_ID" "$(date +%s)")
 
-  # A `while read` on the right of a pipe runs in a subshell, where ghat_fail's
-  # exit would only end the subshell and the loop would continue to the next
-  # account. Splitting on newlines into positionals keeps this in the current
-  # shell so the first failure stops everything.
-  _old_ifs=$IFS
-  IFS='
-'
-  # Deliberately unquoted: IFS is a newline, so each name becomes one positional.
-  # shellcheck disable=SC2086
-  set -- $_names
-  IFS=$_old_ifs
+  # Deliberately unquoted: owner names are validated to letters, digits and
+  # hyphens, so word splitting yields exactly one owner per word.
+  # shellcheck disable=SC2046
+  for _name in $(ghat_owners "$@"); do
 
-  for _name in "$@"; do
+    _repos=$(ghat_owner_repos "$_name" "$@")
+    _body=$(ghat_mint_body "$_perms" "$_repos")
+    if [ "$_repos" = '*' ]; then
+      _scope='every repository'
+    else
+      _scope=$(printf '%s' "$_repos" | tr '\n' ',')
+    fi
 
     _inst=$(ghat_installation_id "$_jwt" "$_name")
 
@@ -179,11 +268,11 @@ ghat_main() {
       -H 'X-GitHub-Api-Version: 2022-11-28' \
       -H "User-Agent: $GHAT_USER_AGENT" \
       -H 'Content-Type: application/json' \
-      -d "{\"permissions\":$_perms}" \
+      -d "$_body" \
       "$GHAT_API/app/installations/$_inst/access_tokens" 2>"$_tmp/curl.err") \
       || ghat_fail "mint request for '$_name' failed: $(cat "$_tmp/curl.err")"
     [ "$_code" = '201' ] \
-      || ghat_fail "token mint for '$_name' failed (HTTP $_code): $(jq -r '.message // ""' <"$_tmp/mint.json") - app $GITHUB_APP_ID, installation $_inst, requested $_perms"
+      || ghat_fail "token mint for '$_name' failed (HTTP $_code): $(jq -r '.message // ""' <"$_tmp/mint.json") - app $GITHUB_APP_ID, installation $_inst, requested $_perms on $_scope"
 
     _token=$(jq -er '.token' <"$_tmp/mint.json") \
       || ghat_fail "the mint response for '$_name' contained no token"
@@ -206,7 +295,7 @@ ghat_main() {
 
     _dest=$(ghat_token_path "$GITHUB_APP_TOKEN_DIR" "$_name")
     ghat_write_token "$_dest" "$_token"
-    ghat_log "$_name: installation $_inst, expires $_expires, token written to $_dest"
+    ghat_log "$_name: installation $_inst, $_scope, expires $_expires, token written to $_dest"
   done
 }
 

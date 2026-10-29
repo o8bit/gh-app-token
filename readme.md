@@ -1,6 +1,7 @@
 # gh-app-token
 
-Mints GitHub App **installation access tokens** and writes one file per account.
+Mints GitHub App **installation access tokens**, limited to the repositories you
+name, and writes one file per owner.
 
 It does that and nothing else. It does not configure git, Composer, Go modules or
 anything else — the caller applies the token wherever it needs it. Earlier
@@ -30,12 +31,13 @@ docker run --rm \
   -v "$PWD/tokens:/tokens" \
   -e GITHUB_APP_PRIVATE_KEY="$(cat app.private-key.pem)" \
   -e GITHUB_APP_ID=123456 \
-  -e GITHUB_APP_ORGS=YOUR_ORG \
+  -e GITHUB_APP_REPOSITORIES=YOUR_ORG/YOUR_REPO \
   -e GITHUB_APP_TOKEN_DIR=/tokens \
-  ghcr.io/o8bit/gh-app-token:1
+  ghcr.io/o8bit/gh-app-token:2
 ```
 
-That writes `./tokens/YOUR_ORG.token`.
+That writes `./tokens/YOUR_ORG.token`, which can reach `YOUR_ORG/YOUR_REPO` and
+nothing else.
 
 ### Environment
 
@@ -43,23 +45,24 @@ That writes `./tokens/YOUR_ORG.token`.
 |---|---|---|
 | `GITHUB_APP_PRIVATE_KEY` | yes | The App private key, as a raw PEM **or** base64-encoded PEM |
 | `GITHUB_APP_ID` | yes | The App's id. Not a secret |
-| `GITHUB_APP_ORGS` | yes | Comma-separated account names, e.g. `org-a,org-b`. Whitespace after commas is fine |
+| `GITHUB_APP_REPOSITORIES` | yes | Comma-separated `owner/repo` entries, e.g. `org-a/lib,org-b/sdk`. `owner/*` for every repository the installation covers. Whitespace after commas is fine |
 | `GITHUB_APP_TOKEN_DIR` | yes | Directory for the token files. Created at mode `0700` if absent |
-| `GITHUB_APP_PERMISSIONS` | no | JSON permission set to request. Default `{"contents":"read"}` |
+| `GITHUB_APP_PERMISSIONS` | no | JSON permission object to request. Default `{"contents":"read"}` |
 
 Base64 is accepted for the key because some CI systems mangle multi-line
 variable values. Either form works; the tool detects which it was given.
 
 ### Output
 
-One file per account, at `$GITHUB_APP_TOKEN_DIR/<account>.token`, mode `0600`,
+One file per owner, at `$GITHUB_APP_TOKEN_DIR/<owner>.token`, mode `0600`,
 containing only the token. Files are created and permission-set *before* the
 token is written, so they are never briefly world-readable with a secret in them.
 
-On success it prints one line per account to stdout:
+On success it prints one line per owner to stdout, naming the repositories its
+token reaches:
 
 ```
-gh-app-token: YOUR_ORG: installation 12345678, expires 2026-08-07T12:34:56Z, token written to /tokens/YOUR_ORG.token
+gh-app-token: YOUR_ORG: installation 12345678, YOUR_REPO, expires 2026-08-07T12:34:56Z, token written to /tokens/YOUR_ORG.token
 ```
 
 **The token itself is never printed** — not on success, not in any error, not in
@@ -68,22 +71,26 @@ any diagnostic. Don't add one.
 ### Exit behaviour
 
 Exits `0` on success, `1` on any failure, `130` if interrupted. Every failure
-prints a `gh-app-token:` prefixed message to stderr naming the account it
-concerns. Failures stop the run immediately — if the first of three accounts
-fails, the other two are not minted.
+prints a `gh-app-token:` prefixed message to stderr naming the owner or entry it
+concerns. Failures stop the run immediately — if the first of three owners
+fails, the other two are not minted. The repository list is validated before
+anything is minted.
 
 Common ones:
 
 | Message | Cause |
 |---|---|
 | `... is not a valid RSA private key` | key missing, truncated, or not RSA |
+| `GITHUB_APP_ORGS was replaced by GITHUB_APP_REPOSITORIES in v2` | a v1 configuration; see [Upgrading from v1](#upgrading-from-v1) |
+| `'X' is not owner/repo` | an entry without exactly one `/`, or with an empty side |
+| `'X/*' cannot be combined with named repositories of 'X'` | the list reads narrower than the token it would mint; keep one or the other |
 | `app N is not installed on 'X' (tried both org and user)` | the App isn't installed on that account |
-| `token mint for 'X' failed (HTTP 422)` | you asked for a permission the installation doesn't grant |
+| `token mint for 'X' failed (HTTP 422)` | a permission the installation doesn't grant, or a repository that doesn't exist or the installation doesn't cover |
 | `the installation for 'X' has no accessible repositories` | installed, but with access to nothing |
 
 ## Before it will work
 
-The App must be **installed on every account** you name in `GITHUB_APP_ORGS`,
+The App must be **installed on every owner** in `GITHUB_APP_REPOSITORIES`,
 and must be granted the permissions you request. Installation is per account: an
 App installs at most once per org or user, so the account name identifies the
 installation unambiguously.
@@ -96,8 +103,8 @@ because reinstalling an App changes its installation id but not the account name
 
 ### Permissions
 
-`GITHUB_APP_PERMISSIONS` narrows the minted token to the subset you actually
-need, and applies to every account in the list:
+`GITHUB_APP_PERMISSIONS` narrows *what* the minted token can do, and applies to
+every owner in the list:
 
 ```sh
 -e GITHUB_APP_PERMISSIONS='{"contents":"read"}'                      # default
@@ -107,18 +114,46 @@ need, and applies to every account in the list:
 
 You can only narrow, never widen. Requesting a permission the installation was
 not granted fails with HTTP 422 — it does not quietly return a lesser token. If
-you need different permissions per account, run the tool twice.
+you need different permissions per owner, run the tool twice.
 
-### Several accounts at once
+### Repositories
 
-A token is scoped to one installation, so private repositories in three orgs
-need three tokens:
+`GITHUB_APP_REPOSITORIES` narrows *where* the token works. Without it, an
+installation token reaches every repository the installation covers — often a
+whole org — when a build usually needs two or three. Name exactly those:
 
 ```sh
--e GITHUB_APP_ORGS='org-a,org-b,org-c'
+-e GITHUB_APP_REPOSITORIES='org-a/lib,org-a/app,org-b/sdk'
 ```
 
-writes `org-a.token`, `org-b.token` and `org-c.token`.
+writes `org-a.token`, reaching `lib` and `app`, and `org-b.token`, reaching
+`sdk`. A token belongs to one installation, so each owner gets its own; the
+owners are read from the entries, in the order they first appear.
+
+`owner/*` mints for every repository the installation covers. It exists for the
+job that genuinely needs a whole org, and makes that scope something written in
+the configuration rather than a default. It cannot be combined with named
+repositories of the same owner.
+
+GitHub rejects a repository that does not exist or that the installation does
+not cover (HTTP 422), so a typo fails the mint rather than producing a token
+that 404s later. For dependency fetches, the list is usually the private
+modules in the project's manifest (`go.mod`, `composer.json`, `package.json`).
+
+### Upgrading from v1
+
+v1 took `GITHUB_APP_ORGS` (action input `orgs`) and minted every token for the
+whole installation. v2 replaces it with `GITHUB_APP_REPOSITORIES` (action input
+`repositories`); setting the old variable fails rather than being ignored.
+The output layout — `<owner>.token` in the token directory — is unchanged, so
+whatever applies the token needs no change.
+
+| v1 | v2, scoped | v2, same scope as v1 |
+|---|---|---|
+| `GITHUB_APP_ORGS=org-a,org-b` | `GITHUB_APP_REPOSITORIES=org-a/lib,org-b/sdk` | `GITHUB_APP_REPOSITORIES=org-a/*,org-b/*` |
+
+The `:1` image and the `v1` git tag stay where they are; nothing moves onto v2
+until its configuration does.
 
 ## Google Cloud Build
 
@@ -130,10 +165,10 @@ availableSecrets:
 
 steps:
   - id: 'gh-token'
-    name: 'ghcr.io/o8bit/gh-app-token:1'
+    name: 'ghcr.io/o8bit/gh-app-token:2'
     env:
       - 'GITHUB_APP_ID=123456'
-      - 'GITHUB_APP_ORGS=YOUR_ORG'
+      - 'GITHUB_APP_REPOSITORIES=YOUR_ORG/YOUR_REPO'
       - 'GITHUB_APP_TOKEN_DIR=/workspace/.gh-tokens'
     secretEnv: [ 'GITHUB_APP_PRIVATE_KEY' ]
     waitFor: [ '-' ]
@@ -166,12 +201,12 @@ somewhere that does not outlive it.
 Use it as a composite action rather than the image:
 
 ```yaml
-- uses: o8bit/gh-app-token@v1
+- uses: o8bit/gh-app-token@v2
   id: gh-token
   with:
     app-id: ${{ secrets.APP_ID }}
     private-key: ${{ secrets.APP_PRIVATE_KEY }}
-    orgs: org-a,org-b
+    repositories: org-a/lib,org-b/sdk
 
 - name: Fetch private modules
   env:
@@ -198,6 +233,9 @@ Action outputs are masked for you; a token read out of a file is not.
 is the obvious alternative, and is simpler if you need one org. It mints per
 owner, so three orgs means three invocations and three separate rewrites — that
 case is what this action is for.
+
+The same repository list scopes every token, so a job that needs one library
+from another org receives a token for that library, not for the org.
 
 ## Using the token
 
@@ -315,13 +353,13 @@ The suite ships inside the image, so you can run it against the exact artefact
 you pull:
 
 ```sh
-docker run --rm --entrypoint sh ghcr.io/o8bit/gh-app-token:1 \
+docker run --rm --entrypoint sh ghcr.io/o8bit/gh-app-token:2 \
   /usr/local/bin/gh-app-token-test.sh
 ```
 
 It is offline — no network, no credentials — and covers base64url encoding, key
-handling in both accepted forms, JWT construction and signature, account-list
-parsing and output paths.
+handling in both accepted forms, JWT construction and signature, repository-list
+parsing and validation, the mint request body, and output paths.
 
 ## Image tags
 
