@@ -43,6 +43,21 @@ fails_with() {
   fi
 }
 
+# ghat_fail exits, so validation runs in a subshell and is judged by its output.
+accepts() {
+  _label=$1; shift
+  _out=$( (ghat_validate_repositories "$@") 2>&1 )
+  check "accepts $_label" "$?:$_out" '0:'
+}
+
+rejects() {
+  _label=$1; _expect=$2; shift 2
+  _out=$( (ghat_validate_repositories "$@") 2>&1 )
+  _rc=$?
+  check "rejects $_label (exit)" "$_rc" '1'
+  contains "rejects $_label (message)" "$_out" "$_expect"
+}
+
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
@@ -63,12 +78,55 @@ check 'strips padding' "$(printf 'a' | ghat_b64u)" 'YQ'
 check 'encodes without newlines' "$(printf 'abc' | ghat_b64u)" 'YWJj'
 check 'uses the url alphabet' "$(printf '\373\377' | ghat_b64u)" '-_8'
 
-echo 'ghat_orgs'
-check 'single name' "$(ghat_orgs 'org-a')" 'org-a'
-check 'several names, one per line' "$(ghat_orgs 'org-a,org-b' | tr '\n' ' ')" 'org-a org-b '
-check 'tolerates spaces after commas' "$(ghat_orgs 'org-a, org-b' | tr '\n' ' ')" 'org-a org-b '
-check 'drops a trailing comma' "$(ghat_orgs 'org-a,' | tr '\n' ' ')" 'org-a '
-check 'empty list yields nothing' "$(ghat_orgs '')" ''
+echo 'ghat_repositories'
+check 'single entry' "$(ghat_repositories 'org-a/x')" 'org-a/x'
+check 'several entries, one per line' "$(ghat_repositories 'org-a/x,org-b/y' | tr '\n' ' ')" 'org-a/x org-b/y '
+check 'tolerates spaces after commas' "$(ghat_repositories 'org-a/x, org-b/y' | tr '\n' ' ')" 'org-a/x org-b/y '
+check 'drops a trailing comma' "$(ghat_repositories 'org-a/x,' | tr '\n' ' ')" 'org-a/x '
+check 'empty list yields nothing' "$(ghat_repositories '')" ''
+
+echo 'ghat_validate_repositories'
+accepts 'owner/repo' 'org-a/x'
+accepts 'owner/* and several owners' 'org-a/*' 'org-b/my.repo_1' 'org-b/other-repo'
+rejects 'a bare owner' 'is not owner/repo' 'org-a'
+rejects 'an empty owner' 'is not owner/repo' '/x'
+rejects 'an empty repository' 'is not owner/repo' 'org-a/'
+rejects 'a nested path' 'is not owner/repo' 'org-a/x/y'
+rejects 'json in the owner' 'invalid owner name' 'org"a/x'
+rejects 'json in the repository' 'invalid repository name' 'org-a/x"}'
+rejects 'a partial wildcard' 'invalid repository name' 'org-a/app-*'
+rejects 'a later bad entry' 'is not owner/repo' 'org-a/x' 'org-b'
+rejects 'owner/* alongside a named repository' 'cannot be combined' 'org-a/x' 'org-a/*'
+
+echo 'ghat_owners'
+check 'one owner per line, in first-seen order, without repeats' \
+  "$(ghat_owners org-b/x org-a/y org-b/z | tr '\n' ' ')" 'org-b org-a '
+
+echo 'ghat_owner_repos'
+check 'only the named owner' "$(ghat_owner_repos org-a org-a/x org-b/y org-a/z | tr '\n' ' ')" 'x z '
+check 'a wildcard is a lone *' "$(ghat_owner_repos org-a org-a/'*' org-b/y)" '*'
+
+echo 'ghat_mint_body'
+check 'limits the token to the named repositories' \
+  "$(ghat_mint_body '{"contents":"read"}' 'x
+y')" '{"permissions":{"contents":"read"},"repositories":["x","y"]}'
+check 'a wildcard sends no repository list' \
+  "$(ghat_mint_body '{"contents":"read"}' '*')" '{"permissions":{"contents":"read"}}'
+
+echo 'ghat_main'
+contains 'refuses the v1 GITHUB_APP_ORGS' \
+  "$( (GITHUB_APP_ORGS=org-a GITHUB_APP_REPOSITORIES=org-a/x ghat_main) 2>&1 )" \
+  'GITHUB_APP_ORGS was replaced by GITHUB_APP_REPOSITORIES'
+contains 'refuses permissions that are not a JSON object' \
+  "$( (GITHUB_APP_ORGS='' GITHUB_APP_PRIVATE_KEY=k GITHUB_APP_ID=1 GITHUB_APP_REPOSITORIES=org-a/x \
+      GITHUB_APP_TOKEN_DIR="$TMP/tokens" GITHUB_APP_PERMISSIONS='contents:read' ghat_main) 2>&1 )" \
+  'GITHUB_APP_PERMISSIONS is not a JSON object'
+# A directory named like the owner, so owner/* would match a file if globbed.
+mkdir -p "$TMP/glob/org-a" && : >"$TMP/glob/org-a/file"
+contains 'does not glob owner/* against the working directory' \
+  "$(cd "$TMP/glob" && (GITHUB_APP_ORGS='' GITHUB_APP_PRIVATE_KEY=k GITHUB_APP_ID=1 \
+      GITHUB_APP_REPOSITORIES='org-a/*,org-a/x' GITHUB_APP_TOKEN_DIR="$TMP/tokens" ghat_main) 2>&1 )" \
+  "'org-a/*' cannot be combined"
 
 echo 'ghat_token_path'
 check 'joins dir and name' "$(ghat_token_path /tokens org-a)" '/tokens/org-a.token'

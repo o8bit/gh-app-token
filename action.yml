@@ -1,6 +1,7 @@
 name: 'gh-app-token'
 description: >-
-  Mints GitHub App installation access tokens and writes one file per account.
+  Mints GitHub App installation access tokens, limited to the repositories you
+  name, and writes one file per owner.
   Mints only - applying the token is the caller's job.
 
 inputs:
@@ -12,15 +13,17 @@ inputs:
   private-key:
     description: "The App's private key, as a raw PEM or a base64-encoded PEM."
     required: true
-  orgs:
+  repositories:
     description: >-
-      Comma-separated accounts to mint a token for. The App must be installed on
-      every one of them - the tool stops at the first account it cannot resolve
-      and does not mint the remainder.
+      Comma-separated owner/repo entries the tokens may reach, e.g.
+      org-a/lib,org-b/sdk. One token is minted per owner, limited to that owner's
+      entries; owner/* covers every repository the installation does. The App
+      must be installed on every owner - the tool stops at the first it cannot
+      resolve and does not mint the remainder.
     required: true
   permissions:
     description: >-
-      JSON permission set to request, applied to every account, e.g.
+      JSON permission set to request, applied to every owner, e.g.
       {"contents":"read"} or {"actions":"write"}. Defaults to the tool's own
       default of {"contents":"read"}. You can only narrow, never widen:
       requesting a permission the installation was not granted fails with 422.
@@ -28,14 +31,14 @@ inputs:
     default: ''
   token-dir:
     description: >-
-      Where to write the <account>.token files. Defaults to a directory under
+      Where to write the <owner>.token files. Defaults to a directory under
       RUNNER_TEMP, which is outside the workspace and cleaned up with the job.
     required: false
     default: ''
 
 outputs:
   token-dir:
-    description: 'Directory holding one <account>.token file per account, mode 0600.'
+    description: 'Directory holding one <owner>.token file per owner, mode 0600.'
     value: ${{ steps.mint.outputs.token-dir }}
 
 runs:
@@ -50,7 +53,7 @@ runs:
       env:
         GITHUB_APP_ID: ${{ inputs.app-id }}
         GITHUB_APP_PRIVATE_KEY: ${{ inputs.private-key }}
-        GITHUB_APP_ORGS: ${{ inputs.orgs }}
+        GITHUB_APP_REPOSITORIES: ${{ inputs.repositories }}
         # An empty value is safe: the tool falls back to its own default.
         GITHUB_APP_PERMISSIONS: ${{ inputs.permissions }}
         TOKEN_DIR_INPUT: ${{ inputs.token-dir }}
@@ -62,14 +65,11 @@ runs:
 
         # Action outputs are masked for you; a token read out of a file is not.
         # Mask every one now, so a later step that echoes one cannot leak it.
-        #
-        # The trailing newline matters. Without it `read` hits EOF on the last
-        # field and the loop body never runs for it, so the last account's token
-        # would go unmasked - which is exactly the leak this loop exists to stop.
-        printf '%s\n' "$GITHUB_APP_ORGS" | tr ',' '\n' | while read -r account; do
-          account="$(printf '%s' "$account" | tr -d '[:space:]')"
-          [ -n "$account" ] || continue
-          printf '::add-mask::%s\n' "$(cat "${GITHUB_APP_TOKEN_DIR}/${account}.token")"
+        # Every file in the directory is masked, so the set cannot drift from
+        # what was minted the way re-parsing the input list could.
+        for token_file in "$GITHUB_APP_TOKEN_DIR"/*.token; do
+          [ -f "$token_file" ] || continue
+          printf '::add-mask::%s\n' "$(cat "$token_file")"
         done
 
         printf 'token-dir=%s\n' "$GITHUB_APP_TOKEN_DIR" >>"$GITHUB_OUTPUT"

@@ -40,9 +40,12 @@ and nothing else. CI asserts that `git`, `php`, `composer` and `gh` are *absent*
 — that assertion is deliberate, not leftover scaffolding. Adding a dependency
 means every consumer pays for it.
 
-**Don't pipe into the account loop.** A `while read` on the right of a pipe runs
-in a subshell, where `ghat_fail`'s `exit` only leaves the subshell and the run
-continues as if nothing failed. The loop is `for _name in "$@"` for that reason.
+**Don't pipe into the owner loop, and fail outside `$(...)`.** A `while read` on
+the right of a pipe runs in a subshell, and so does a command substitution;
+`ghat_fail`'s `exit` there only leaves the subshell and the run continues as if
+nothing failed. That is why the entries become positionals, why
+`ghat_validate_repositories` runs in the current shell before anything is
+minted, and why the helpers called through `$(...)` never fail.
 
 **Treat tokens as opaque.** GitHub is rolling between two installation-token
 formats — a short opaque string, and a ~520-char `ghs_`-prefixed JWT with dots
@@ -54,14 +57,14 @@ individual functions, and only `ghat_main` is guarded.
 ## Tests
 
 ```sh
-sh gh-app-token-test.sh                                  # 26 assertions, offline
-docker run --rm --entrypoint sh ghcr.io/o8bit/gh-app-token:1 \
+sh gh-app-token-test.sh                                  # 54 assertions, offline
+docker run --rm --entrypoint sh ghcr.io/o8bit/gh-app-token:2 \
   /usr/local/bin/gh-app-token-test.sh                    # against a pulled image
 ```
 
 Offline by design — no network, no credentials, no real App. Covers base64url
-encoding, both accepted key forms, JWT construction and signature, account-list
-parsing, output paths and file modes. Keep it that way: a test needing a real
+encoding, both accepted key forms, JWT construction and signature, repository-list
+parsing and validation, the mint request body, output paths and file modes. Keep it that way: a test needing a real
 private key is a test nobody runs.
 
 Every behaviour change needs an assertion. Don't add one that can't fail —

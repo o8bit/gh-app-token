@@ -44,7 +44,7 @@ jobs:
       # before a trailing newline was added to its input.
       - name: Check the composite Action wiring
         env:
-          GITHUB_APP_ORGS: 'org-a,org-b'
+          GITHUB_APP_REPOSITORIES: 'org-a/x,org-a/y,org-b/*'
         run: |
           set -eu
           run_block=$(python3 -c "
@@ -55,7 +55,7 @@ jobs:
           mkdir -p stub && cat >stub/gh-app-token <<'STUB'
           #!/bin/sh
           mkdir -p "$GITHUB_APP_TOKEN_DIR"
-          for a in $(printf '%s' "$GITHUB_APP_ORGS" | tr ',' ' '); do
+          for a in $(printf '%s' "$GITHUB_APP_REPOSITORIES" | tr ',' '\n' | cut -d/ -f1 | sort -u); do
             printf 'tok-%s' "$a" >"$GITHUB_APP_TOKEN_DIR/$a.token"
           done
           STUB
