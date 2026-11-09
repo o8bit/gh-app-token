@@ -211,11 +211,33 @@ Use it as a composite action rather than the image:
 - name: Fetch private modules
   env:
     TOKEN_DIR: ${{ steps.gh-token.outputs.token-dir }}
+    GIT_CONFIG_GLOBAL: ${{ runner.temp }}/gh-app-token.gitconfig
   run: |
-    git config --global \
-      "url.https://x-access-token:$(cat "$TOKEN_DIR/org-a.token")@github.com/org-a/.insteadOf" \
-      "https://github.com/org-a/"
+    trap 'rm -rf "$GIT_CONFIG_GLOBAL" "$TOKEN_DIR"' EXIT
+    for token_file in "$TOKEN_DIR"/*.token; do
+      owner=$(basename "$token_file" .token)
+      git config --global \
+        "url.https://x-access-token:$(cat "$token_file")@github.com/$owner/.insteadOf" \
+        "https://github.com/$owner/"
+    done
+    go mod download
+
+- name: Test
+  run: go test ./...
 ```
+
+Fetch dependencies in the step that applies the token, and remove the token
+before anything else runs. A build or test step runs the code under test and
+every dependency it pulls in, and any of that can read a credential left on the
+runner. `GIT_CONFIG_GLOBAL` points that step's git at a file of its own, so
+the runner's real global config never holds the token, and the `trap` removes
+the file and the token directory even when the fetch fails. Later steps then run
+with no credential at all, and a dependency missed by the fetch step fails
+authentication rather than being fetched with the token.
+
+`go mod download` with no arguments fetches every module `go build` and
+`go test ./...` need. For other ecosystems, use the equivalent
+dependency-only command: `composer install --no-scripts --no-plugins`, `npm ci --ignore-scripts`.
 
 `app-id` takes the App's id **or** its client id — the value is only the JWT
 issuer, and GitHub accepts either. `permissions` and `token-dir` are optional;
